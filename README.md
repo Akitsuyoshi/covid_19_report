@@ -1,6 +1,7 @@
 # Covid-19 report
 
-Report file is [here](./report.Rmd)
+The report R file is [here](./report.Rmd).
+The expected outcome is similar to [this pdf](./report.pdf).
 
 ## Prerequisite
 

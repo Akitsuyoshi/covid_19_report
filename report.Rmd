@@ -1,7 +1,7 @@
 ---
-title: "Covid 19 Data Report"
+title: "Report for Japanese covid-19 death cases"
 author: "Tsuyoshi Akiyama"
-date: '2022-06-01'
+date: '2022-06-04'
 output: pdf_document
 ---
 
@@ -15,180 +15,221 @@ knitr::opts_chunk$set(
 
 ## Abstract
 
-This report's purpose is to analyze the time-series covid 19 data, including confirmed cases and deaths. The report follows the 6 steps, prerequisite, loading, tidy, visualizing, modeling, and considering biases. The main research is to find correlation between them.
+This report's purpose is to analyze the Japanese time-series covid-19 data, including confirmed cases, deaths, and vaccinated. The main goal is to find which factors affect a lot to the people who died of covid-19 in Japan.
 
+I will first collect covid-19's and vaccinated data from the 2 github repos. Next, I will clean them up to combine both to the one `global` table, then show 2 visualizations. I utilize random forest model to find a set of predictors that best explains the covid-19 new death cases. I will see 3 independent variables, new confirmed cases, partial vaccinated, fully vaccinated toward 1 dependent new death variable. Lastly, I will conclude the outcome and consider 2 possible biases behind this analysis.
 
-## Introduction
+The data sources are publicly operated by Johns Hopkins University in the github repo. The sources are inside https://github.com/CSSEGISandData/COVID-19, licenced under the Creative Commons Attribution 4.0 International. The data times pan is between 01/2020 to current day.
 
 ## Prerequisite
 
-* install necessary libraries
+-   Install and load necessary libraries
+-   Define source URLs
+-   Set `country` variable. If you wanna see the different country case, other than Japan, change this variable here.
 
 ```{r setting}
-# Dependencies
+# Install dependencies
+if (!require(tidyverse)) {
+  install.packages("tidyverse", repos = "http://cran.us.r-project.org")
+}
+if (!require(lubridate)) {
+  install.packages("lubridate", repos = "http://cran.us.r-project.org")
+}
+if (!require(randomForest)) {
+  install.packages("randomForest", repos = "http://cran.us.r-project.org")
+}
+# Load dependencies
 library(tidyverse)
 library(lubridate)
-library(ggplot2)
+library(randomForest)
+# URLs
+url_in = "https://raw.githubusercontent.com/CSSEGISandData/COVID-19/master/csse_covid_19_data/csse_covid_19_time_series/"
+file_names = c("time_series_covid19_confirmed_global.csv",
+               "time_series_covid19_deaths_global.csv"
+               )
+urls <- str_c(url_in, file_names)
+uid_url <- "https://raw.githubusercontent.com/CSSEGISandData/COVID-19/master/csse_covid_19_data/UID_ISO_FIPS_LookUp_Table.csv"
+vaccine_data_url <- "https://raw.githubusercontent.com/govex/COVID-19/master/data_tables/vaccine_data/global_data/time_series_covid19_vaccine_global.csv"
+country <- "Japan"
 ```
 
-## Load the data
+## Load and Tidy
 
-Get every shooting incident data in NYC from 2006 to 2020.
+### Load the data
+
+I don't get recovered data here because it wasn't recorded since 09/2021.
+
 ```{r read_source}
-source_url <- "https://data.cityofnewyork.us/api/views/833y-fsy8/rows.csv"
-# Get the data
-source_data <- read_csv(source_url)
+# Get the covid-19 confirmed case and death data
+cases <- read_csv(urls[1])
+deaths <- read_csv(urls[2])
+# UIDs
+uids <- read_csv(uid_url)
+# Vaccines
+vaccines <- read_csv(vaccine_data_url)
 ```
 
 See the data's dimension, spec, and summary.
+
 ```{r spec_shooting_incidents, results='hide'}
-dim(source_data)
+dim(cases)
 # See original data specification
-spec(source_data)
-summary(source_data)
+# spec(cases)
 ```
 
-## Tidy the data
+### Tidy the data
 
-### Clean 
-* Convert characterized date, OCCUR_DATE and OCCUR_TIME, to lubridate:datetime format. 
-* Select necessary columns for later analysis.
-* Change gender label, from (M, F, U) to (Male, Female, Unknown)
+-   Reformat characterized date to lubridate:datetime.
+-   Select necessary columns for later analysis.
+-   Combine all collected data into 1 `global` table.
+
 ```{r formats}
-shooting_incidents <- source_data %>% 
-  select(OCCUR_DATE, OCCUR_TIME, VIC_AGE_GROUP, VIC_SEX) %>% 
-  mutate(OCCUR_DATE = mdy(OCCUR_DATE),
-         OCCUR_TIME = hms(OCCUR_TIME),
-         VIC_SEX = as.factor(VIC_SEX),
-         VIC_SEX = factor(VIC_SEX,
-                          levels = c("M", "F", "U"),
-                          labels = c("Male", "Female", "Unknown")))
+cases <- cases %>% 
+  pivot_longer(cols = -c(`Province/State`,
+                         `Country/Region`,
+                         Lat,
+                         Long),
+               names_to = "date",
+               values_to = "cases"
+               ) %>% 
+  filter(cases > 0) %>% 
+  select(-c(Lat, Long)) %>% 
+  mutate(date = mdy(date))
+
+deaths <- deaths %>% 
+  pivot_longer(cols = -c(`Province/State`,
+                         `Country/Region`,
+                         Lat,
+                         Long),
+               names_to = "date",
+               values_to = "deaths"
+               ) %>% 
+  select(-c(Lat, Long)) %>% 
+  mutate(date = mdy(date))
+
+uids <- uids %>% 
+  select(-c(Lat, Long_, Combined_Key, code3, iso2, iso3, Admin2, UID, FIPS))
+
+vaccines <- vaccines %>% 
+  select(-c(Doses_admin, Report_Date_String, UID)) %>% 
+  rename(date = Date) %>% 
+  mutate(date = ymd(date))
 ```
 
-### Convert the data
-The 4 converted data will be used at visualization step.
-```{r incident_per_something}
-shooting_incidents_per_year <- shooting_incidents %>% 
-  mutate(OCCUR_DATE = year(OCCUR_DATE)) %>% 
-  group_by(OCCUR_DATE) %>% 
-  summarise(n = n()) %>% 
-  arrange(OCCUR_DATE) %>% 
-  ungroup()
+I operate left-joined all data by its Country_Region, Province_State, and date columns. 
+Now we have 1 time-series `global` table, having confirmed cases, deaths, population, and vaccinated cases.
 
-shooting_incidents_per_hour <- shooting_incidents %>% 
-  mutate(OCCUR_TIME = hour(OCCUR_TIME)) %>% 
-  group_by(OCCUR_TIME) %>% 
-  summarise(n = n()) %>% 
-  arrange(OCCUR_TIME) %>% 
-  ungroup()
-
-shooting_incidents_per_vict <- shooting_incidents %>% 
-  filter(VIC_AGE_GROUP != "UNKNOWN") %>% 
-  group_by(VIC_AGE_GROUP, VIC_SEX) %>% 
-  summarise(n = n()) %>% 
-  arrange(VIC_AGE_GROUP) %>% 
-  ungroup()
-
-shooting_incidents_per_date_gender <- shooting_incidents %>% 
-  group_by(OCCUR_DATE, VIC_SEX) %>% 
-  summarise(n = n()) %>% 
-  ungroup()
+```{r combine_data, message=TRUE}
+global <- cases %>% 
+  left_join(deaths, by = c("Country/Region", "Province/State", "date")) %>% 
+  rename(Country_Region = `Country/Region`,
+         Province_State = `Province/State`) %>% 
+  left_join(uids, by = c("Province_State", "Country_Region")) %>% 
+  left_join(vaccines, by = c("Province_State", "Country_Region", "date"))
+  
+dim(global)
+summary(global)
 ```
-
-`shooting_incidents_per_gender` will be used at model step.
-```{r incident_per_gender}
-shooting_incidents_per_gender <- shooting_incidents %>%
-  group_by(OCCUR_DATE, VIC_SEX) %>% 
-  summarise(n = n()) %>% 
-  spread(key = VIC_SEX, value = n) %>% 
-  mutate(Female = replace_na(Female, 0),
-         Male = replace_na(Male, 0)) %>% 
-  ungroup()
-```
-
 
 ## Visualize the data
 
-### Incidents number per year
-The shooting incident per year had decreased yearly from 2006 to 2019, 2000 to 1000 incidents/year. However, in 2020, the incidents number nearly doubled as 2019.
-```{r vis_per_year}
-shooting_incidents_per_year %>% 
-  ggplot(aes(x = OCCUR_DATE, y = n)) +
-  geom_line(color='#314DEA') +
-  scale_x_continuous(breaks = seq(2006, 2020, by = 2)) +
+### New cases and deaths in Japan
+
+-   1st image is for new covid-19 confirmed cases and deaths in Japan.
+-   The red line shows new cases, while blue one for new deaths.
+-   There are correlation between the two variables.
+
+```{r viz_0}
+global %>% 
+  filter(Country_Region %in% c(country)) %>% 
+  mutate(new_death = c(deaths[1], diff(deaths)), new_case = c(cases[1], diff(cases))) %>% 
+  ggplot(aes(x = date)) +
+  geom_line(aes(y = new_death, color = "new_death", label = new_death)) +
+  geom_line(aes(y = new_case, color = "new_case", label = new_case)) +
   theme_bw() +
-  theme(legend.position = "bottom", panel.grid.minor = element_blank()) +
-  labs(title = "NYC shooting incidents per year from 2006 to 2020", y = NULL, x = "year") +
-  ylim(0, 2200)
-
-```
-
-### Incidents number per hour
-Peaking at 23:00, the number of crimes decreases until 8:00.
-```{r vis_per_hour}
-shooting_incidents_per_hour %>% 
-  ggplot(aes(x = OCCUR_TIME, y = n, size = n, color = n)) +
-  geom_point() + 
-  scale_color_gradientn(colors = rainbow(6))+
-  scale_x_continuous(breaks = seq(0, 23, by = 1)) +
-  theme_bw() +
-  theme(legend.position = "bottom", panel.grid.minor = element_blank()) +
-  labs(title = "NYC shooting incidents per hour from 2006 to 2020", y = NULL, x = "hour")
-```
-
-### Incidents victim per age and gender
-The male victims account for a large portion of total victims at any ages. 25-44 years old has the most high possibility to be victim, while over 65 has the lowest of that.
-```{r vis_per_vic}
-shooting_incidents_per_vict %>% 
-  ggplot(aes(x = VIC_AGE_GROUP, y = n, fill = VIC_SEX)) +
-  geom_bar(stat = "identity", width = 0.4) +
-  theme_bw() +
-  theme(legend.position = "bottom") +
-  labs(title = "NYC shooting incidents victim per age and gender from 2006 to 2020", y = NULL, x = "age")
-```
-
-### Incidents victim per gender
-Incidents number by victim gender shows on time series, from 2006 to 2020. While male victim number mostly is higher than female's, the both seem to correlate each other.
-```{r}
-shooting_incidents_per_date_gender %>% 
-  ggplot(aes(x = OCCUR_DATE, y = n, color = VIC_SEX)) +
-  geom_line() +
   scale_y_log10() +
+  theme(legend.position = "bottom", panel.grid.minor = element_blank()) +
+  labs(title = "New cases and deaths in Japan", y = "", x = "year")
+```
+
+### New deaths and fully vaccinated in Japan
+
+-   2nd image is for new covid-19 deaths and fully vaccinated ratio in Japan.
+-   The red line shows fully vaccinated ratio, while blue one for new deaths.
+-   The takeaway is no relationships between them, just by seeing those 2 variables.
+
+```{r vis_1}
+vaccinatd_scale <- 300
+global %>% 
+  filter(Country_Region %in% c(country)) %>% 
+  mutate(new_death = c(deaths[1], diff(deaths)), fully_vaccinated =  (People_fully_vaccinated / Population)) %>% 
+  ggplot(aes(x = date)) +
+  geom_line(aes(y = new_death, color = "new_death", label = new_death)) +
+  geom_line(aes(y = vaccinatd_scale * fully_vaccinated, color = "fully_vaccinated", label = fully_vaccinated)) +
   theme_bw() +
   theme(legend.position = "bottom", panel.grid.minor = element_blank()) +
-  labs(title = "NYC shooting incidents per victim sex from 2006 to 2020", y = NULL, x = "year")
+  scale_y_continuous(
+    name = "New Death",
+    sec.axis = sec_axis(~./vaccinatd_scale, name="Fully vaccinated")
+  )
 ```
+
+In above visualization steps, The new cases seems the most influential factor to new death in Japan. Is it true? I don't yet decide its the biggest factor since vaccine could decrease the covid-19 death rate. So I try to make the model in the next section.
 
 ## Model the data
 
-### Hypothesis
-There are correlation between male and female victim. If so, the more male victims increase, the more female victims increase.
+I will apply Random Forest Model to see the most influential factors to new death cases in Japan.
 
-### Make the model
-Utilize linear model to `shooting_incidents_per_gender` to get the statistical relationships between male and female victim.
+### Feature Selection
 
-```{r model, results='hide'}
-model <- lm(Female ~ Male, data = shooting_incidents_per_gender)
-summary(model)
+-   Find which one affects the most to new death cases among `new_case`, `partial_vaccinated`, and `fully_vaccinated`.
+-   Random Forest Model fits well in this case, having no hypothesis.
+
+```{r feature_selection}
+Japan_data <- global %>% 
+  filter(Country_Region %in% c(country)) %>% 
+  mutate(new_death = c(deaths[1], diff(deaths)), partial_vaccinated =  (People_partially_vaccinated / Population), fully_vaccinated =  (People_fully_vaccinated / Population), new_case = c(cases[1], diff(cases)))
+
+Japan_data.rf <- randomForest(new_death ~ new_case + partial_vaccinated + fully_vaccinated, data = Japan_data, na.action = na.roughfix, importance = TRUE)
+imp = varImpPlot(Japan_data.rf)
+imp <- as.data.frame(imp)
+imp$varnames <- rownames(imp)
+rownames(imp) <- NULL  
 ```
 
-### Visualize model's prediction
-See the prediction to see the relationship. Blue points show the actual data, while red points are the prediction.
-```{r viz_model}
-shooting_incidents_per_gender %>% 
-  mutate(pred = predict(model)) %>% 
-  ggplot() +
-  geom_point(aes(x = Male, y = Female), color = 'blue') +
-  geom_point(aes(x = Male, y = pred), color = 'red')
-            
+### Visualize the result
+
+-   Find which one affects the most to new death cases among `new_case`, `partial_vaccinated`, and `fully_vaccinated`.
+-   Most influential variable is `new_case`, whereas `fully_vaccinated` are the second factor. 
+
+```{r viz_rf}
+ggplot(imp, aes(x=reorder(varnames, IncNodePurity), y=IncNodePurity, color=as.factor(varnames))) + 
+  geom_point() +
+  geom_segment(aes(x=varnames,xend=varnames,y=0,yend=IncNodePurity)) +
+  scale_color_discrete(name="Variable Name") +
+  ylab("IncNodePurity") +
+  xlab("Variable Name") +
+  coord_flip() + 
+  theme(
+    legend.position="bottom",
+    panel.grid.major.y = element_blank(),
+    panel.border = element_blank(),
+    axis.ticks.y = element_blank()
+  )
+```
+```{r pred}
+pred_rf <- predict(Japan_data.rf, Japan_data)
+print(tail(pred_rf))
 ```
 
-### Assess prediciton
-The slope of prediction line is small so there is a weak correlation between male and female victim. 
+## Outcome and Biases
 
-## Possible biases
+### Outcome
 
-One possible bias is a distribution bias by gender. The most data are the male victims under 44 years old. I need to gather more female data, or normalize the data to ease the one sided distribution.
+New confirmed cases of covid-19 has the most influence to new death cases in Japan, while fully and partially vaccinated numbers are followed. The more new case increase, the more death increase. Vaccine has affected death case increment but not to new confirmed cases.
 
-Another bias is variable selection bias. I use `VIC_SEX` column to analyse the relationship between male and female victim. The selected variable is not good enough to see the expected results. For instance, the incidents number in 2020 nearly doubled as 2019, but any variables in the dataset answer this change. There might be another factor, outside of datasets, to affect shooting incidents in NYC.
+### Possible biases
 
+One possible bias is country bias. I use Japan as a sample in this report. If I need to take care of other areas, I should've applied this random forest to another countries. One way is to use 40 countries as training set, and different 10 countries as test set.
+
+Another bias is inconsistent variable value. I need to compare "apple to apple" for the consistency. Vaccine might be from different maker, while inspection methods might vary on different time span. If I get a bit more detailed data, the outcome will change.
